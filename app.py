@@ -28,6 +28,14 @@ def get_token():
 @app.get("/health")
 def health(): return {"status":"ok"}
 
+@app.route('/')
+def index():
+    return jsonify({
+        "status": "UPS PRL microservice is live",
+        "environment": "production",
+        "version": "1.0.0"
+    })
+
 @app.post("/labels/create")
 def create_label():
     # Expect JSON {to:{name,addr1,city,state,zip,country,phone}, weight_oz}
