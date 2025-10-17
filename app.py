@@ -1,10 +1,12 @@
-import os, base64, io, requests
+import os, io, base64, requests
 from flask import Flask, request, jsonify, send_file
-from dotenv import load_dotenv
 from flask_cors import CORS
+from dotenv import load_dotenv
 
+# ===== Load env =====
 load_dotenv()
 
+# ===== App & CORS =====
 app = Flask(__name__)
 
 ALLOWED_ORIGINS = [
@@ -12,41 +14,37 @@ ALLOWED_ORIGINS = [
     "https://www.firstimpressions-dentallab.com",
     "https://reward.easytechinfo.net",
 ]
-
 CORS(
     app,
-    resources={r"/*": {"origins": ALLOWED_ORIGINS}},   # or origins="*"
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=False,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "transId", "transactionSrc"],
     expose_headers=["Content-Type"],
 )
 
-# ---- Config ----
-UPS_ENV = os.getenv("UPS_ENV", "prod").lower()  # "sandbox" or "prod"
-UPS_BASE = "https://wwwcie.ups.com" if UPS_ENV == "sandbox" else "https://onlinetools.ups.com"
-
-CLIENT_ID      = os.getenv("UPS_CLIENT_ID")
-CLIENT_SECRET  = os.getenv("UPS_CLIENT_SECRET")
-SHIPPER_NO     = os.getenv("UPS_SHIPPER_NUMBER")   # e.g., 1Y703V
-PROMO_CODE     = os.getenv("UPS_PROMO_CODE", "")   # optional
+# ===== Config =====
+UPS_ENV   = os.getenv("UPS_ENV", "prod").lower()     # "sandbox" or "prod"
+UPS_BASE  = "https://wwwcie.ups.com" if UPS_ENV == "sandbox" else "https://onlinetools.ups.com"
+CLIENT_ID = os.getenv("UPS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("UPS_CLIENT_SECRET")
+SHIPPER_NO = os.getenv("UPS_SHIPPER_NUMBER")  # e.g., 1Yxxxx
+PROMO_CODE = os.getenv("UPS_PROMO_CODE", "EIGSHIPSUPS")
 
 if not CLIENT_ID or not CLIENT_SECRET:
     raise RuntimeError("Missing UPS_CLIENT_ID / UPS_CLIENT_SECRET in environment.")
 
-# ---- Helpers ----
+# ===== OAuth helpers =====
 def get_token():
     """Client Credentials OAuth2 (no user login)"""
     token_url = f"{UPS_BASE}/security/v1/oauth/token"
     basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
-
     headers = {
         "Authorization": f"Basic {basic}",
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
     data = {"grant_type": "client_credentials"}
-
     r = requests.post(token_url, headers=headers, data=data, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"UPS token HTTP {r.status_code}: {r.text}")
@@ -59,12 +57,11 @@ def ups_headers():
         "Authorization": f"Bearer {tok}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        # optional request identifiers
         "transId": "firstimpressions-prl",
         "transactionSrc": "firstimpressions-site",
     }
 
-# ---- Routes ----
+# ===== Routes =====
 @app.get("/health")
 def health():
     return {"status": "ok", "env": UPS_ENV, "base": UPS_BASE}
@@ -79,59 +76,64 @@ def token_test():
 
 @app.get("/")
 def root():
-    return jsonify({
-        "status": "UPS PRL microservice is live",
-        "environment": UPS_ENV,
-        "version": "1.1.0"
-    })
+    return jsonify({"status": "UPS PRL microservice is live", "environment": UPS_ENV, "version": "1.2.0"})
 
 @app.post("/labels/create")
 def create_label():
     """
-    Expects JSON like:
+    Request JSON:
     {
       "to": { "name": "...", "addr1": "...", "city": "...", "state": "AZ", "zip": "...", "country": "US", "phone": "480..." },
       "weight_lbs": 1,
-      "format": "PDF",       # optional: "PDF" or "GIF" (default PDF)
-      "mode": "outbound",    # optional: "outbound" | "return" (default outbound)
-      "reference": "Case #123"  # optional free-text
+      "format": "PDF",       # optional: PDF|GIF (default PDF)
+      "mode": "outbound",    # optional: outbound|return (default outbound)
+      "reference": "Case #123"   # optional
     }
+
+    Response:
+      - file download (PDF/GIF) by default
+      - JSON when query param ?json=1 is present
     """
     try:
-        body = request.get_json(force=True)
-        if not body or "to" not in body:
+        body = request.get_json(force=True) or {}
+        if "to" not in body:
             return {"ok": False, "error": "Missing 'to' address"}, 400
-
         if not SHIPPER_NO:
             return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
 
-        # ---- Hard-coded shipment defaults ----
+        # --- Hard-coded shipment defaults (per client) ---
         DIMENSIONS_IN = {"UnitOfMeasurement": {"Code": "IN"}, "Length": "6", "Width": "5", "Height": "5"}
         MERCHANDISE_DESCRIPTION = "Dental Products"
         DECLARED_VALUE = {"CurrencyCode": "USD", "MonetaryValue": "100"}
 
+        # Label format
         fmt = str(body.get("format", "PDF")).upper()
         if fmt not in ("PDF", "GIF"):
             fmt = "PDF"
 
-        service_code = body.get("service_code", "03")  # 03 = UPS® Ground
+        service_code = str(body.get("service_code", "03"))  # 03 = UPS® Ground
 
-        # Who are we shipping to? (flip for return)
-        mode = (body.get("mode") or "outbound").lower().strip()
+        # Mode (direction)
+        mode = (body.get("mode") or "outbound").strip().lower()
         if mode not in ("outbound", "return"):
             mode = "outbound"
 
-        # Patient address (from body)
+        # Patient/office address (from request)
+        to_json = body["to"]
         patient = {
-            "Name": body["to"]["name"],
+            "Name": (to_json.get("name") or "").strip() or "Recipient",
             "Address": {
-                "AddressLine": [body["to"]["addr1"]],
-                "City": body["to"]["city"],
-                "StateProvinceCode": body["to"]["state"],
-                "PostalCode": body["to"]["zip"],
-                "CountryCode": body["to"]["country"]
+                "AddressLine": [to_json.get("addr1", "")],
+                "City": to_json.get("city", ""),
+                "StateProvinceCode": to_json.get("state", ""),
+                "PostalCode": to_json.get("zip", ""),
+                "CountryCode": to_json.get("country", "US"),
             }
         }
+        phone = (to_json.get("phone") or "").strip()
+        if phone:
+            patient["Phone"] = {"Number": phone}
+
         # Lab (shipper) constants
         lab = {
             "Name": "First Impressions Dental Lab",
@@ -145,10 +147,10 @@ def create_label():
             }
         }
 
-        # Build base Shipment
+        # Build Shipment skeleton
         shipment = {
-            "Description": MERCHANDISE_DESCRIPTION,  # hard-coded merch/contents
-            "Shipper": lab,
+            "Description": MERCHANDISE_DESCRIPTION,
+            "Shipper": lab,  # account billed
             "PaymentInformation": {
                 "ShipmentCharge": {
                     "Type": "01",  # Transportation
@@ -157,43 +159,42 @@ def create_label():
             },
             "Service": {"Code": service_code},
             "Package": {
-                "Packaging": {"Code": "02"},  # Customer-supplied package
+                "Packaging": {"Code": "02"},  # Customer-supplied
                 "PackageWeight": {
                     "UnitOfMeasurement": {"Code": "LBS"},
                     "Weight": str(body.get("weight_lbs", 1))
                 },
-                # --- Hard-coded dimensions and declared value ---
                 "Dimensions": DIMENSIONS_IN,
-                "PackageServiceOptions": {
-                    "DeclaredValue": DECLARED_VALUE
-                }
+                "PackageServiceOptions": {"DeclaredValue": DECLARED_VALUE}
             }
         }
 
-        # Reference (optional): attach at Shipment level
-        ref_val = (body.get("reference") or "").strip()
-        if ref_val:
-            shipment["ReferenceNumber"] = [{"Code": "PO", "Value": ref_val}]
-
-        # Outbound vs Return address wiring
+        # === Address wiring per mode ===
         if mode == "outbound":
-            # Lab -> Patient
-            shipment["ShipTo"] = patient
-            # Optional explicit ShipFrom = lab
-            shipment["ShipFrom"] = {
-                "Name": lab["Name"],
-                "Address": lab["Address"]
-            }
+            # Lab → Patient
+            shipment["ShipFrom"] = {"Name": lab["Name"], "Address": lab["Address"]}
+            shipment["ShipTo"]   = patient
             filename_prefix = "shipping-label"
         else:
-            # Return: Patient -> Lab
-            shipment["ShipTo"] = {
-                "Name": lab["Name"],
-                "Address": lab["Address"]
-            }
+            # Return: Dental Office (user) → Lab
             shipment["ShipFrom"] = patient
+            shipment["ShipTo"]   = {"Name": lab["Name"], "Address": lab["Address"]}
             filename_prefix = "return-label"
 
+        # === References at PACKAGE level (Shipment-level may be disallowed -> 120541) ===
+        pkg_refs = []
+        # User-provided case/patient reference (optional)
+        ref_val = (body.get("reference") or "").strip()
+        if ref_val:
+            pkg_refs.append({"Code": "PO", "Value": ref_val})
+        # Always tag promo for auditing
+        if PROMO_CODE:
+            pkg_refs.append({"Code": "PM", "Value": f"Promo:{PROMO_CODE}"})
+        if pkg_refs:
+            # Some accounts accept array; if 400 occurs with code about array, switch to single object.
+            shipment["Package"]["ReferenceNumber"] = pkg_refs
+
+        # Build request
         ship_request = {
             "ShipmentRequest": {
                 "Request": {"RequestOption": "nonvalidate"},
@@ -202,27 +203,31 @@ def create_label():
             }
         }
 
+        # Call UPS
         url = f"{UPS_BASE}/api/shipments/v2409/ship"
-        r = requests.post(url, headers=ups_headers(), json=ship_request, timeout=45)
+        resp = requests.post(url, headers=ups_headers(), json=ship_request, timeout=45)
 
-        if r.status_code >= 300:
-            return {"ok": False, "status": r.status_code, "error": r.text}, r.status_code
+        # Bubble real UPS errors
+        if resp.status_code >= 300:
+            return {"ok": False, "status": resp.status_code, "error": resp.text}, resp.status_code
 
-        data = r.json()
-        pkg = data["ShipmentResponse"]["ShipmentResults"]["PackageResults"]
+        data = resp.json()
+        # Normalize PackageResults shape (object vs array)
+        pkg = data["ShipmentResponse"]["ShipmentResults"].get("PackageResults")
         if isinstance(pkg, list):
             pkg = pkg[0]
 
         label_b64 = pkg["ShippingLabel"]["GraphicImage"]
         tracking  = pkg.get("TrackingNumber")
 
-        file_bytes = base64.b64decode(label_b64)
-        ext = "pdf" if fmt == "PDF" else "gif"
-        filename = f"{filename_prefix}.{ext}"
-
+        # Optional JSON response
         if request.args.get("json") == "1":
             return {"ok": True, "tracking": tracking, "label_base64": label_b64, "format": fmt}
 
+        # File download
+        ext = "pdf" if fmt == "PDF" else "gif"
+        filename = f"{filename_prefix}.{ext}"
+        file_bytes = base64.b64decode(label_b64)
         return send_file(
             io.BytesIO(file_bytes),
             mimetype=("application/pdf" if fmt == "PDF" else "image/gif"),
@@ -233,6 +238,6 @@ def create_label():
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
-# ---- Entrypoint ----
+# ===== Entrypoint =====
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
