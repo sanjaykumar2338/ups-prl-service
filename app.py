@@ -1,10 +1,26 @@
 import os, base64, io, requests
 from flask import Flask, request, jsonify, send_file
 from dotenv import load_dotenv
+from flask_cors import CORS
 
 load_dotenv()
 
 app = Flask(__name__)
+
+ALLOWED_ORIGINS = [
+    "https://firstimpressions-dentallab.com",
+    "https://www.firstimpressions-dentallab.com",
+    "https://reward.easytechinfo.net",
+]
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},   # or origins="*"
+    supports_credentials=False,
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "transId", "transactionSrc"],
+    expose_headers=["Content-Type"],
+)
 
 # ---- Config ----
 UPS_ENV = os.getenv("UPS_ENV", "prod").lower()  # "sandbox" or "prod"
