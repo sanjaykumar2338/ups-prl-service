@@ -137,10 +137,10 @@ def create_label():
             "Name": "First Impressions Dental Lab",
             "ShipperNumber": SHIPPER_NO,
             "Address": {
-                "AddressLine": ["125 W Broadway St"],
-                "City": "Mesa",
+                "AddressLine": ["700 North Neely Street, Ste. #17"],
+                "City": "Gilbert",
                 "StateProvinceCode": "AZ",
-                "PostalCode": "85210",
+                "PostalCode": "85233",
                 "CountryCode": "US"
             }
         }
