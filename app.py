@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PyPDF2 import PdfReader, PdfWriter
+import re
 # ===== Load env =====
 load_dotenv()
 
@@ -35,6 +36,10 @@ PROMO_CODE = os.getenv("UPS_PROMO_CODE", "EIGSHIPSUPS")
 
 if not CLIENT_ID or not CLIENT_SECRET:
     raise RuntimeError("Missing UPS_CLIENT_ID / UPS_CLIENT_SECRET in environment.")
+
+_REF_ALLOWED = re.compile(r"[^A-Za-z0-9 \-._/]+")
+def _clean_ref(s: str, maxlen: int = 35) -> str:
+    return _REF_ALLOWED.sub("", (s or "")).strip()[:maxlen]
 
 # ===== OAuth helpers =====
 def get_token():
@@ -151,14 +156,22 @@ def create_label():
 
         # --- References (visible in panel) ---
         refs = []
-        ref_val = (body.get("reference") or "").strip()
-        if ref_val:
-            refs.append({"Code": "PO", "Value": f"{sender_name} | {ref_val}"})
+        # User reference (cleaned)
+        user_ref = _clean_ref(body.get("reference"))
+        if user_ref:
+            refs.append({"Code": "PO", "Value": user_ref})
         else:
-            refs.append({"Code": "PO", "Value": sender_name})
+            # fall back to sender name (cleaned)
+            refs.append({"Code": "PO", "Value": _clean_ref(sender_name)})
+
+        # Promo tag (no colon)
         if PROMO_CODE:
-            refs.append({"Code": "PM", "Value": f"Promo:{PROMO_CODE}"})
+            promo_ref = _clean_ref(f"Promo {PROMO_CODE}")
+            if promo_ref:
+                refs.append({"Code": "PM", "Value": promo_ref})
+
         shipment["Package"]["ReferenceNumber"] = refs
+
 
         ship_request = {
             "ShipmentRequest": {
