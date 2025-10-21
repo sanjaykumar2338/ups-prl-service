@@ -81,21 +81,18 @@ def root():
 @app.post("/labels/create")
 def create_label():
     """
-    Always creates a RETURN label:
-      ShipFrom = user-provided address (dental office)
-      ShipTo   = Lab address
+    Creates a UPS PRINT RETURN LABEL (PRL):
+      - ShipFrom = sender (dental office) entered by user  -> this name prints on label
+      - ShipTo   = First Impressions Dental Lab (Gilbert)
+      - Shipper  = Lab (billed account)
 
-    Request JSON:
-    {
-      "to": { "name": "...", "addr1": "...", "city": "...", "state": "AZ", "zip": "...", "country": "US", "phone": "480..." },
-      "weight_lbs": 1,
-      "format": "PDF",          # optional: PDF|GIF (default PDF)
-      "reference": "Case #123"  # optional
-    }
-
-    Response:
-      - file download (PDF/GIF) by default
-      - JSON when query param ?json=1 is present
+    JSON:
+      {
+        "to": { "name": "...", "addr1": "...", "city": "...", "state": "AZ", "zip": "...", "country": "US", "phone": "480..." },
+        "weight_lbs": 1,
+        "format": "PDF",
+        "reference": "Case #123"
+      }
     """
     try:
         body = request.get_json(force=True) or {}
@@ -104,35 +101,39 @@ def create_label():
         if not SHIPPER_NO:
             return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
 
-        # --- Fixed shipment defaults ---
+        # --- fixed defaults ---
         DIMENSIONS_IN = {"UnitOfMeasurement": {"Code": "IN"}, "Length": "6", "Width": "5", "Height": "5"}
         MERCHANDISE_DESCRIPTION = "Dental Products"
         DECLARED_VALUE = {"CurrencyCode": "USD", "MonetaryValue": "100"}
 
-        # Label format
         fmt = str(body.get("format", "PDF")).upper()
         if fmt not in ("PDF", "GIF"):
             fmt = "PDF"
 
-        service_code = str(body.get("service_code", "03"))  # 03 = UPS® Ground
+        service_code = "03"  # UPS Ground
 
-        # User (dental office) address
+        # ----- sender (prints on label) -----
         to_json = body["to"]
-        patient = {
-            "Name": (to_json.get("name") or "").strip() or "Sender",
+        sender_name  = (to_json.get("name") or "").strip() or "Sender"
+        sender_phone = (to_json.get("phone") or "").strip()
+
+        ship_from = {
+            # many tenants print CompanyName/AttentionName on PRL labels; include all
+            "Name": sender_name,
+            "CompanyName": sender_name,
+            "AttentionName": sender_name,
             "Address": {
                 "AddressLine": [to_json.get("addr1", "")],
                 "City": to_json.get("city", ""),
                 "StateProvinceCode": to_json.get("state", ""),
                 "PostalCode": to_json.get("zip", ""),
-                "CountryCode": to_json.get("country", "US"),
+                "CountryCode": to_json.get("country", "US")
             }
         }
-        phone = (to_json.get("phone") or "").strip()
-        if phone:
-            patient["Phone"] = {"Number": phone}
+        if sender_phone:
+            ship_from["Phone"] = {"Number": sender_phone}
 
-        # Lab (shipper) constants
+        # ----- lab (billed account + destination) -----
         lab = {
             "Name": "First Impressions Dental Lab",
             "ShipperNumber": SHIPPER_NO,
@@ -145,21 +146,27 @@ def create_label():
             }
         }
 
-        # Build Shipment (RETURN only: From user -> To lab)
         shipment = {
             "Description": MERCHANDISE_DESCRIPTION,
-            "Shipper": lab,  # account billed
+            "Shipper": lab,  # billed account
             "PaymentInformation": {
                 "ShipmentCharge": {
-                    "Type": "01",  # Transportation
+                    "Type": "01",
                     "BillShipper": {"AccountNumber": SHIPPER_NO}
                 }
             },
-            "Service": {"Code": service_code},
-            "ShipFrom": patient,                                   # RETURN: FROM user
-            "ShipTo":   {"Name": lab["Name"], "Address": lab["Address"]},  # TO lab
+            "Service": {"Code": service_code},            # e.g., 03 = Ground
+            "ShipFrom": ship_from,                        # sender (prints on label)
+            "ShipTo": {
+                "Name": lab["Name"],
+                "AttentionName": "Receiving",
+                "Address": lab["Address"]
+            },
+            "ShipmentServiceOptions": {                   # <<-- MOVE IT HERE
+                "ReturnService": {"Code": "02"}           # 02 = PRL (Print Return Label)
+            },
             "Package": {
-                "Packaging": {"Code": "02"},  # Customer-supplied
+                "Packaging": {"Code": "02"},
                 "PackageWeight": {
                     "UnitOfMeasurement": {"Code": "LBS"},
                     "Weight": str(body.get("weight_lbs", 1))
@@ -169,15 +176,15 @@ def create_label():
             }
         }
 
-        # ---- References at PACKAGE level ----
+        # references at PACKAGE level (account disallows Shipment.ReferenceNumber)
         pkg_refs = []
         ref_val = (body.get("reference") or "").strip()
         if ref_val:
-            pkg_refs.append({"Code": "PO", "Value": ref_val})           # Case/Patient ref
+            pkg_refs.append({"Code": "PO", "Value": ref_val})
         if PROMO_CODE:
-            pkg_refs.append({"Code": "PM", "Value": f"Promo:{PROMO_CODE}"})  # Promo tag
+            pkg_refs.append({"Code": "PM", "Value": f"Promo:{PROMO_CODE}"})
         if pkg_refs:
-            shipment["Package"]["ReferenceNumber"] = pkg_refs  # if 400 later, switch to single object
+            shipment["Package"]["ReferenceNumber"] = pkg_refs
 
         ship_request = {
             "ShipmentRequest": {
@@ -187,7 +194,6 @@ def create_label():
             }
         }
 
-        # Call UPS
         url = f"{UPS_BASE}/api/shipments/v2409/ship"
         resp = requests.post(url, headers=ups_headers(), json=ship_request, timeout=45)
 
@@ -202,11 +208,9 @@ def create_label():
         label_b64 = pkg["ShippingLabel"]["GraphicImage"]
         tracking  = pkg.get("TrackingNumber")
 
-        # JSON mode
         if request.args.get("json") == "1":
             return {"ok": True, "tracking": tracking, "label_base64": label_b64, "format": fmt}
 
-        # File download
         ext = "pdf" if fmt == "PDF" else "gif"
         filename = f"return-label.{ext}"
         file_bytes = base64.b64decode(label_b64)
