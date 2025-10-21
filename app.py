@@ -87,18 +87,36 @@ def root():
 
 @app.post("/labels/create")
 def create_label():
+    """
+    Return label (PRL) – BillShipper to lab account.
+    Adds a visible 'FROM: <sender>' banner at top of the PDF.
+    Supports ?json=1 to return JSON with label_base64.
+    """
+    import re, tempfile
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    from PyPDF2 import PdfReader, PdfWriter
+
+    # --- helpers ---
+    _REF_ALLOWED = re.compile(r"[^A-Za-z0-9 \-._/]+")
+    def _clean_ref(s: str, maxlen: int = 35) -> str:
+        return _REF_ALLOWED.sub("", (s or "")).strip()[:maxlen]
+
     try:
         body = request.get_json(force=True) or {}
+
         if "to" not in body:
             return {"ok": False, "error": "Missing 'to' address"}, 400
         if not SHIPPER_NO:
             return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
 
-        # --- Defaults ---
+        # --- Defaults/consts ---
+        fmt = (body.get("format") or "PDF").upper()
+        if fmt not in ("PDF", "GIF"):
+            fmt = "PDF"
+        service_code = "03"  # UPS Ground
         DIMENSIONS_IN = {"UnitOfMeasurement": {"Code": "IN"}, "Length": "6", "Width": "5", "Height": "5"}
         DECLARED_VALUE = {"CurrencyCode": "USD", "MonetaryValue": "100"}
-        fmt = (body.get("format") or "PDF").upper()
-        service_code = "03"
 
         # --- Sender (dental office) ---
         to_json = body["to"]
@@ -121,7 +139,7 @@ def create_label():
         if sender_phone:
             ship_from["Phone"] = {"Number": sender_phone}
 
-        # --- Lab info ---
+        # --- Lab (destination + billed shipper) ---
         LAB_ZIP = "85233"
         lab_addr = {
             "AddressLine": ["700 North Neely Street, Ste. #17"],
@@ -131,7 +149,7 @@ def create_label():
             "CountryCode": "US",
         }
 
-        # --- Shipment (BillShipper, PRL) ---
+        # --- Shipment payload (PRL) ---
         shipment = {
             "Description": "Dental Products",
             "Shipper": {
@@ -143,7 +161,7 @@ def create_label():
                 "ShipmentCharge": {"Type": "01", "BillShipper": {"AccountNumber": SHIPPER_NO}}
             },
             "Service": {"Code": service_code},
-            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},
+            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},  # PRL
             "ShipFrom": ship_from,
             "ShipTo": {"Name": "First Impressions Dental Lab", "Address": lab_addr},
             "Package": {
@@ -154,25 +172,17 @@ def create_label():
             },
         }
 
-        # --- References (visible in panel) ---
+        # --- References (sanitize to avoid 120603) ---
         refs = []
-        # User reference (cleaned)
         user_ref = _clean_ref(body.get("reference"))
-        if user_ref:
-            refs.append({"Code": "PO", "Value": user_ref})
-        else:
-            # fall back to sender name (cleaned)
-            refs.append({"Code": "PO", "Value": _clean_ref(sender_name)})
-
-        # Promo tag (no colon)
+        refs.append({"Code": "PO", "Value": user_ref or _clean_ref(sender_name)})
         if PROMO_CODE:
             promo_ref = _clean_ref(f"Promo {PROMO_CODE}")
             if promo_ref:
                 refs.append({"Code": "PM", "Value": promo_ref})
-
         shipment["Package"]["ReferenceNumber"] = refs
 
-
+        # --- UPS API call ---
         ship_request = {
             "ShipmentRequest": {
                 "Request": {"RequestOption": "nonvalidate"},
@@ -181,7 +191,6 @@ def create_label():
             }
         }
 
-        # --- UPS API call ---
         url = f"{UPS_BASE}/api/shipments/v2409/ship"
         resp = requests.post(url, headers=ups_headers(), json=ship_request, timeout=45)
         if resp.status_code >= 300:
@@ -192,41 +201,62 @@ def create_label():
         if isinstance(pkg, list):
             pkg = pkg[0]
         label_b64 = pkg["ShippingLabel"]["GraphicImage"]
-        tracking = pkg.get("TrackingNumber")
+        tracking = pkg.get("TrackingNumber") or ""
 
-        # --- Decode label + overlay custom sender note ---
+        # --- Decode label + overlay note ---
         label_pdf = base64.b64decode(label_b64)
-        label_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        overlay_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        label_temp.write(label_pdf)
-        label_temp.close()
 
-        c = canvas.Canvas(overlay_temp.name, pagesize=letter)
-        c.setFillColorRGB(0.9, 0.9, 0.9)     # light gray background
-        c.rect(320, 730, 220, 18, fill=True, stroke=False)
-        c.setFillColorRGB(0, 0, 0)           # switch text back to black
-        c.setFont("Helvetica-Bold", 9)
-        text = f"From: {sender_name} | {sender_addr}"
-        text_width = c.stringWidth(text, "Helvetica-Bold", 9)
-        x_center = (letter[0] - text_width) / 2
-        c.drawString(x_center, 740, text)
-        c.save()
+        label_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        overlay_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        merged_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
 
-        overlay = PdfReader(overlay_temp.name)
-        base = PdfReader(label_temp.name)
-        writer = PdfWriter()
-        page = base.pages[0]
-        page.merge_page(overlay.pages[0])
-        writer.add_page(page)
+        try:
+            with open(label_tmp.name, "wb") as f:
+                f.write(label_pdf)
 
-        final_pdf = io.BytesIO()
-        writer.write(final_pdf)
-        final_pdf.seek(0)
+            # draw a top banner so it's always visible
+            c = canvas.Canvas(overlay_tmp.name, pagesize=letter)
+            # Draw banner at bottom (always visible)
+            c.setFillColorRGB(0.15, 0.15, 0.15)
+            c.rect(0, 30, 612, 25, fill=1, stroke=0)
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("Helvetica-Bold", 10)
+            note = f"FROM: {sender_name} • {sender_addr}"
+            text_width = c.stringWidth(note, "Helvetica-Bold", 10)
+            c.drawString((612 - text_width) / 2, 38, note[:100])
+            c.save()
 
-        if request.args.get("json") == "1":
-            return {"ok": True, "tracking": tracking, "format": fmt}
+            base = PdfReader(label_tmp.name)
+            overlay = PdfReader(overlay_tmp.name)
+            page = base.pages[0]
+            page.merge_page(overlay.pages[0])
+            writer = PdfWriter()
+            writer.add_page(page)
+            with open(merged_tmp.name, "wb") as f:
+                writer.write(f)
 
-        return send_file(final_pdf, mimetype="application/pdf", as_attachment=True, download_name="return-label.pdf")
+            # JSON mode (for debugging / widget preview path)
+            if request.args.get("json") == "1":
+                with open(merged_tmp.name, "rb") as f:
+                    merged_b64 = base64.b64encode(f.read()).decode()
+                return {"ok": True, "tracking": tracking, "format": fmt, "label_base64": merged_b64}
+
+            # File stream
+            with open(merged_tmp.name, "rb") as f:
+                final_bytes = f.read()
+            return send_file(
+                io.BytesIO(final_bytes),
+                mimetype=("application/pdf" if fmt == "PDF" else "image/gif"),
+                as_attachment=True,
+                download_name=("return-label.pdf" if fmt == "PDF" else "return-label.gif"),
+            )
+        finally:
+            # cleanup temp files
+            for t in (label_tmp.name, overlay_tmp.name, merged_tmp.name):
+                try:
+                    os.unlink(t)
+                except Exception:
+                    pass
 
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
