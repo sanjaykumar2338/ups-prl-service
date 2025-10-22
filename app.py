@@ -87,38 +87,25 @@ def root():
 
 @app.post("/labels/create")
 def create_label():
-    """
-    Return label (PRL) – BillShipper to lab account.
-    Adds a visible 'FROM: <sender>' banner at top of the PDF.
-    Supports ?json=1 to return JSON with label_base64.
-    """
-    import re, tempfile
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import letter
-    from PyPDF2 import PdfReader, PdfWriter
-
-    # --- helpers ---
-    _REF_ALLOWED = re.compile(r"[^A-Za-z0-9 \-._/]+")
-    def _clean_ref(s: str, maxlen: int = 35) -> str:
-        return _REF_ALLOWED.sub("", (s or "")).strip()[:maxlen]
-
+    print("Received label creation request")
+    # Note: Using the globally defined _clean_ref function
+    
     try:
         body = request.get_json(force=True) or {}
-
         if "to" not in body:
             return {"ok": False, "error": "Missing 'to' address"}, 400
         if not SHIPPER_NO:
             return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
 
-        # --- Defaults/consts ---
         fmt = (body.get("format") or "PDF").upper()
         if fmt not in ("PDF", "GIF"):
             fmt = "PDF"
+
         service_code = "03"  # UPS Ground
         DIMENSIONS_IN = {"UnitOfMeasurement": {"Code": "IN"}, "Length": "6", "Width": "5", "Height": "5"}
         DECLARED_VALUE = {"CurrencyCode": "USD", "MonetaryValue": "100"}
 
-        # --- Sender (dental office) ---
+        # --- Sender info ---
         to_json = body["to"]
         sender_name = (to_json.get("name") or "").strip() or "Sender"
         sender_addr = f"{to_json.get('addr1','')}, {to_json.get('city','')}, {to_json.get('state','')} {to_json.get('zip','')}"
@@ -139,7 +126,7 @@ def create_label():
         if sender_phone:
             ship_from["Phone"] = {"Number": sender_phone}
 
-        # --- Lab (destination + billed shipper) ---
+        # --- Lab destination ---
         LAB_ZIP = "85233"
         lab_addr = {
             "AddressLine": ["700 North Neely Street, Ste. #17"],
@@ -149,7 +136,6 @@ def create_label():
             "CountryCode": "US",
         }
 
-        # --- Shipment payload (PRL) ---
         shipment = {
             "Description": "Dental Products",
             "Shipper": {
@@ -161,7 +147,7 @@ def create_label():
                 "ShipmentCharge": {"Type": "01", "BillShipper": {"AccountNumber": SHIPPER_NO}}
             },
             "Service": {"Code": service_code},
-            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},  # PRL
+            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},
             "ShipFrom": ship_from,
             "ShipTo": {"Name": "First Impressions Dental Lab", "Address": lab_addr},
             "Package": {
@@ -172,7 +158,7 @@ def create_label():
             },
         }
 
-        # --- References (sanitize to avoid 120603) ---
+        # --- References ---
         refs = []
         user_ref = _clean_ref(body.get("reference"))
         refs.append({"Code": "PO", "Value": user_ref or _clean_ref(sender_name)})
@@ -182,7 +168,6 @@ def create_label():
                 refs.append({"Code": "PM", "Value": promo_ref})
         shipment["Package"]["ReferenceNumber"] = refs
 
-        # --- UPS API call ---
         ship_request = {
             "ShipmentRequest": {
                 "Request": {"RequestOption": "nonvalidate"},
@@ -203,9 +188,8 @@ def create_label():
         label_b64 = pkg["ShippingLabel"]["GraphicImage"]
         tracking = pkg.get("TrackingNumber") or ""
 
-        # --- Decode label + overlay note ---
+        # --- PDF overlay ---
         label_pdf = base64.b64decode(label_b64)
-
         label_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         overlay_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         merged_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
@@ -214,16 +198,22 @@ def create_label():
             with open(label_tmp.name, "wb") as f:
                 f.write(label_pdf)
 
-            # draw a top banner so it's always visible
             c = canvas.Canvas(overlay_tmp.name, pagesize=letter)
-            # Draw banner at bottom (always visible)
+            page_width, page_height = letter
+            banner_thickness = 25  # visual height of the strip after rotation
+            note = f"FROM: {sender_name} • {sender_addr}"
+            display_note = note[:110]
+
+            # Rotate the drawing context so the banner sits along the right edge.
+            c.saveState()
+            c.translate(page_width, 0)
+            c.rotate(90)
             c.setFillColorRGB(0.15, 0.15, 0.15)
-            c.rect(0, 30, 612, 25, fill=1, stroke=0)
+            c.rect(0, 0, page_height, banner_thickness, fill=1, stroke=0)
             c.setFillColorRGB(1, 1, 1)
             c.setFont("Helvetica-Bold", 10)
-            note = f"FROM: {sender_name} • {sender_addr}"
-            text_width = c.stringWidth(note, "Helvetica-Bold", 10)
-            c.drawString((612 - text_width) / 2, 38, note[:100])
+            c.drawString(18, 8, display_note)
+            c.restoreState()
             c.save()
 
             base = PdfReader(label_tmp.name)
@@ -235,13 +225,12 @@ def create_label():
             with open(merged_tmp.name, "wb") as f:
                 writer.write(f)
 
-            # JSON mode (for debugging / widget preview path)
+            # JSON preview mode
             if request.args.get("json") == "1":
                 with open(merged_tmp.name, "rb") as f:
                     merged_b64 = base64.b64encode(f.read()).decode()
                 return {"ok": True, "tracking": tracking, "format": fmt, "label_base64": merged_b64}
 
-            # File stream
             with open(merged_tmp.name, "rb") as f:
                 final_bytes = f.read()
             return send_file(
@@ -250,8 +239,9 @@ def create_label():
                 as_attachment=True,
                 download_name=("return-label.pdf" if fmt == "PDF" else "return-label.gif"),
             )
+
         finally:
-            # cleanup temp files
+            # Clean up temp files
             for t in (label_tmp.name, overlay_tmp.name, merged_tmp.name):
                 try:
                     os.unlink(t)
