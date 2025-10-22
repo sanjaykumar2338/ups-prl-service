@@ -199,12 +199,23 @@ def create_label():
 
             c = canvas.Canvas(t_overlay.name, pagesize=letter)
             pw, ph = letter
+
             c.saveState()
-            c.translate(pw, 0); c.rotate(90)
-            c.setFillColorRGB(0.15,0.15,0.15); c.rect(0,0,ph,25,fill=1,stroke=0)
-            c.setFillColorRGB(1,1,1); c.setFont("Helvetica-Bold",10)
-            c.drawString(18,8,(f"FROM: {sender_name} • {sender_addr}")[:110])
-            c.restoreState(); c.save()
+            c.translate(pw, 0)
+            c.rotate(90)
+
+            # Draw background bar slightly above bottom edge to prevent clipping
+            c.setFillColorRGB(0.15, 0.15, 0.15)
+            c.rect(0, 5, ph, 25, fill=1, stroke=0)
+
+            # Draw centered white text
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("Helvetica-Bold", 10)
+            note = f"FROM: {sender_name} • {sender_addr}"[:110]
+            c.drawString(18, 13, note)  # shifted up a bit for perfect vertical centering
+
+            c.restoreState()
+            c.save()
 
             base = PdfReader(t_label.name); over = PdfReader(t_overlay.name)
             page = base.pages[0]; page.merge_page(over.pages[0])
