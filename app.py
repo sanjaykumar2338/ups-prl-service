@@ -87,46 +87,43 @@ def root():
 
 @app.post("/labels/create")
 def create_label():
-    print("Received label creation request")
-    # Note: Using the globally defined _clean_ref function
-    
+    import re, tempfile, base64, io, os, requests
+    from flask import request, send_file
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    from PyPDF2 import PdfReader, PdfWriter
+
+    _REF_ALLOWED = re.compile(r"[^A-Za-z0-9 \-._/]+")
+    def _clean_ref(s, n=35): return _REF_ALLOWED.sub("", (s or "")).strip()[:n]
+
     try:
         body = request.get_json(force=True) or {}
-        if "to" not in body:
-            return {"ok": False, "error": "Missing 'to' address"}, 400
-        if not SHIPPER_NO:
-            return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
+        if "to" not in body: return {"ok": False, "error": "Missing 'to' address"}, 400
+        if not SHIPPER_NO:  return {"ok": False, "error": "Missing UPS_SHIPPER_NUMBER env"}, 500
 
         fmt = (body.get("format") or "PDF").upper()
-        if fmt not in ("PDF", "GIF"):
-            fmt = "PDF"
+        if fmt not in ("PDF","GIF"): fmt = "PDF"
 
-        service_code = "03"  # UPS Ground
-        DIMENSIONS_IN = {"UnitOfMeasurement": {"Code": "IN"}, "Length": "6", "Width": "5", "Height": "5"}
-        DECLARED_VALUE = {"CurrencyCode": "USD", "MonetaryValue": "100"}
-
-        # --- Sender info ---
-        to_json = body["to"]
-        sender_name = (to_json.get("name") or "").strip() or "Sender"
-        sender_addr = f"{to_json.get('addr1','')}, {to_json.get('city','')}, {to_json.get('state','')} {to_json.get('zip','')}"
-        sender_phone = (to_json.get("phone") or "").strip()
-
+        # sender (customer)
+        to = body["to"]
+        sender_name  = (to.get("name") or "").strip() or "Sender"
+        sender_addr  = f"{to.get('addr1','')}, {to.get('city','')}, {to.get('state','')} {to.get('zip','')}"
         ship_from = {
             "Name": sender_name,
             "CompanyName": sender_name,
             "AttentionName": sender_name,
             "Address": {
-                "AddressLine": [to_json.get("addr1", "")],
-                "City": to_json.get("city", ""),
-                "StateProvinceCode": to_json.get("state", ""),
-                "PostalCode": to_json.get("zip", ""),
-                "CountryCode": to_json.get("country", "US"),
-            },
+                "AddressLine": [to.get("addr1","")],
+                "City": to.get("city",""),
+                "StateProvinceCode": to.get("state",""),
+                "PostalCode": to.get("zip",""),
+                "CountryCode": to.get("country","US"),
+            }
         }
-        if sender_phone:
-            ship_from["Phone"] = {"Number": sender_phone}
+        if (to.get("phone") or "").strip():
+            ship_from["Phone"] = {"Number": to["phone"].strip()}
 
-        # --- Lab destination ---
+        # lab (destination)
         LAB_ZIP = "85233"
         lab_addr = {
             "AddressLine": ["700 North Neely Street, Ste. #17"],
@@ -138,41 +135,46 @@ def create_label():
 
         shipment = {
             "Description": "Dental Products",
+
+            # IMPORTANT: put lab account on ShipperNumber (satisfies 120100)
+            # but keep the sender's address/name so "Ship From" reflects customer.
             "Shipper": {
                 "ShipperNumber": SHIPPER_NO,
-                "Name": "First Impressions Dental Lab",
-                "Address": lab_addr,
+                **ship_from
             },
+
             "PaymentInformation": {
-                "ShipmentCharge": {"Type": "01", "BillShipper": {"AccountNumber": SHIPPER_NO}}
+                "ShipmentCharge": {
+                    "Type": "01",
+                    "BillShipper": { "AccountNumber": SHIPPER_NO }   # avoid 120412
+                }
             },
-            "Service": {"Code": service_code},
-            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},
+
+            "Service": {"Code": "03"},
+            "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},  # PRL
             "ShipFrom": ship_from,
-            "ShipTo": {"Name": "First Impressions Dental Lab", "Address": lab_addr},
+            "ShipTo": { "Name": "First Impressions Dental Lab", "Address": lab_addr },
+
             "Package": {
                 "Packaging": {"Code": "02"},
                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": str(body.get("weight_lbs", 1))},
-                "Dimensions": DIMENSIONS_IN,
-                "PackageServiceOptions": {"DeclaredValue": DECLARED_VALUE},
-            },
+                "Dimensions": {"UnitOfMeasurement":{"Code":"IN"}, "Length":"6","Width":"5","Height":"5"},
+                "PackageServiceOptions": {"DeclaredValue": {"CurrencyCode":"USD","MonetaryValue":"100"}}
+            }
         }
 
-        # --- References ---
-        refs = []
-        user_ref = _clean_ref(body.get("reference"))
-        refs.append({"Code": "PO", "Value": user_ref or _clean_ref(sender_name)})
+        # references (sanitized)
+        refs = [{"Code":"PO","Value": _clean_ref(body.get("reference")) or _clean_ref(sender_name)}]
         if PROMO_CODE:
-            promo_ref = _clean_ref(f"Promo {PROMO_CODE}")
-            if promo_ref:
-                refs.append({"Code": "PM", "Value": promo_ref})
+            pr = _clean_ref(f"Promo {PROMO_CODE}")
+            if pr: refs.append({"Code":"PM","Value":pr})
         shipment["Package"]["ReferenceNumber"] = refs
 
         ship_request = {
             "ShipmentRequest": {
                 "Request": {"RequestOption": "nonvalidate"},
                 "Shipment": shipment,
-                "LabelSpecification": {"LabelImageFormat": {"Code": fmt}},
+                "LabelSpecification": {"LabelImageFormat": {"Code": fmt}}
             }
         }
 
@@ -183,71 +185,46 @@ def create_label():
 
         data = resp.json()
         pkg = data["ShipmentResponse"]["ShipmentResults"].get("PackageResults")
-        if isinstance(pkg, list):
-            pkg = pkg[0]
+        if isinstance(pkg, list): pkg = pkg[0]
+        tracking  = pkg.get("TrackingNumber") or ""
         label_b64 = pkg["ShippingLabel"]["GraphicImage"]
-        tracking = pkg.get("TrackingNumber") or ""
 
-        # --- PDF overlay ---
-        label_pdf = base64.b64decode(label_b64)
-        label_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        overlay_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        merged_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-
+        # overlay note on right edge (bottom when rotated)
+        base_pdf = base64.b64decode(label_b64)
+        t_label = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        t_overlay = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        t_merged = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         try:
-            with open(label_tmp.name, "wb") as f:
-                f.write(label_pdf)
+            with open(t_label.name,"wb") as f: f.write(base_pdf)
 
-            c = canvas.Canvas(overlay_tmp.name, pagesize=letter)
-            page_width, page_height = letter
-            banner_thickness = 25  # visual height of the strip after rotation
-            note = f"FROM: {sender_name} • {sender_addr}"
-            display_note = note[:110]
-
-            # Rotate the drawing context so the banner sits along the right edge.
+            c = canvas.Canvas(t_overlay.name, pagesize=letter)
+            pw, ph = letter
             c.saveState()
-            c.translate(page_width, 0)
-            c.rotate(90)
-            c.setFillColorRGB(0.15, 0.15, 0.15)
-            c.rect(0, 0, page_height, banner_thickness, fill=1, stroke=0)
-            c.setFillColorRGB(1, 1, 1)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(18, 8, display_note)
-            c.restoreState()
-            c.save()
+            c.translate(pw, 0); c.rotate(90)
+            c.setFillColorRGB(0.15,0.15,0.15); c.rect(0,0,ph,25,fill=1,stroke=0)
+            c.setFillColorRGB(1,1,1); c.setFont("Helvetica-Bold",10)
+            c.drawString(18,8,(f"FROM: {sender_name} • {sender_addr}")[:110])
+            c.restoreState(); c.save()
 
-            base = PdfReader(label_tmp.name)
-            overlay = PdfReader(overlay_tmp.name)
-            page = base.pages[0]
-            page.merge_page(overlay.pages[0])
-            writer = PdfWriter()
-            writer.add_page(page)
-            with open(merged_tmp.name, "wb") as f:
-                writer.write(f)
+            base = PdfReader(t_label.name); over = PdfReader(t_overlay.name)
+            page = base.pages[0]; page.merge_page(over.pages[0])
+            w = PdfWriter(); w.add_page(page)
+            with open(t_merged.name,"wb") as f: w.write(f)
 
-            # JSON preview mode
             if request.args.get("json") == "1":
-                with open(merged_tmp.name, "rb") as f:
-                    merged_b64 = base64.b64encode(f.read()).decode()
-                return {"ok": True, "tracking": tracking, "format": fmt, "label_base64": merged_b64}
+                with open(t_merged.name,"rb") as f:
+                    return {"ok": True, "tracking": tracking, "format": fmt,
+                            "label_base64": base64.b64encode(f.read()).decode()}
 
-            with open(merged_tmp.name, "rb") as f:
-                final_bytes = f.read()
-            return send_file(
-                io.BytesIO(final_bytes),
-                mimetype=("application/pdf" if fmt == "PDF" else "image/gif"),
-                as_attachment=True,
-                download_name=("return-label.pdf" if fmt == "PDF" else "return-label.gif"),
-            )
-
+            with open(t_merged.name,"rb") as f: final_bytes = f.read()
+            return send_file(io.BytesIO(final_bytes),
+                             mimetype=("application/pdf" if fmt=="PDF" else "image/gif"),
+                             as_attachment=True,
+                             download_name=("return-label.pdf" if fmt=="PDF" else "return-label.gif"))
         finally:
-            # Clean up temp files
-            for t in (label_tmp.name, overlay_tmp.name, merged_tmp.name):
-                try:
-                    os.unlink(t)
-                except Exception:
-                    pass
-
+            for p in (t_label.name, t_overlay.name, t_merged.name):
+                try: os.unlink(p)
+                except: pass
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
