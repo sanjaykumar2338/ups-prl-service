@@ -177,11 +177,6 @@ def create_label():
         if sender_phone:
             ship_from["Phone"] = {"Number": sender_phone}
 
-        # lab (destination)
-        # Keep the destination address lines in UPS street-then-suite order.
-        lab_street, lab_suite = LAB_ADDRESS["AddressLine"]
-        lab_addr = {**LAB_ADDRESS, "AddressLine": [lab_street, lab_suite]}
-
         shipment = {
             "Description": "Dental Products",
 
@@ -202,7 +197,21 @@ def create_label():
             "Service": {"Code": "03"},
             "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},  # PRL
             "ShipFrom": ship_from,
-            "ShipTo": { "Name": LAB_NAME, "Address": lab_addr },
+            "ShipTo": {
+                "Name": LAB_NAME,
+                "Address": {
+                    # UPS prints the second destination address line above the first on this label,
+                    # so send suite before street to render street first on the printed label.
+                    "AddressLine": [
+                        LAB_ADDRESS["AddressLine"][1],
+                        LAB_ADDRESS["AddressLine"][0],
+                    ],
+                    "City": LAB_ADDRESS["City"],
+                    "StateProvinceCode": LAB_ADDRESS["StateProvinceCode"],
+                    "PostalCode": LAB_ADDRESS["PostalCode"],
+                    "CountryCode": LAB_ADDRESS["CountryCode"],
+                },
+            },
 
             "Package": {
                 "Packaging": {"Code": "02"},
