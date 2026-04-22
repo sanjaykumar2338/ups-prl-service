@@ -11,6 +11,6 @@ services:
       - key: UPS_CLIENT_SECRET
         sync: false
       - key: UPS_SHIPPER_NUMBER
-        value: "1Y703V"
+        value: "1BV665"
       - key: UPS_PROMO_CODE
         value: "EIGSHIPSUPS"

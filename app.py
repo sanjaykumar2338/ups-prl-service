@@ -31,15 +31,61 @@ UPS_ENV   = os.getenv("UPS_ENV", "prod").lower()     # "sandbox" or "prod"
 UPS_BASE  = "https://wwwcie.ups.com" if UPS_ENV == "sandbox" else "https://onlinetools.ups.com"
 CLIENT_ID = os.getenv("UPS_CLIENT_ID")
 CLIENT_SECRET = os.getenv("UPS_CLIENT_SECRET")
-SHIPPER_NO = os.getenv("UPS_SHIPPER_NUMBER")  # e.g., 1Yxxxx
+SHIPPER_NO = os.getenv("UPS_SHIPPER_NUMBER")  # UPS account number used for PRL billing
 PROMO_CODE = os.getenv("UPS_PROMO_CODE", "EIGSHIPSUPS")
+LAB_NAME = "First Impressions Dental Lab"
+LAB_ADDRESS = {
+    "AddressLine": ["701 W. Southern Ave #104"],
+    "City": "Mesa",
+    "StateProvinceCode": "AZ",
+    "PostalCode": "85210",
+    "CountryCode": "US",
+}
 
 if not CLIENT_ID or not CLIENT_SECRET:
     raise RuntimeError("Missing UPS_CLIENT_ID / UPS_CLIENT_SECRET in environment.")
 
 _REF_ALLOWED = re.compile(r"[^A-Za-z0-9 \-._/]+")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 def _clean_ref(s: str, maxlen: int = 35) -> str:
     return _REF_ALLOWED.sub("", (s or "")).strip()[:maxlen]
+
+def _clean_text(value) -> str:
+    value = "" if value is None else str(value)
+    value = _CONTROL_CHARS.sub(" ", value.replace("\r", " ").replace("\n", " "))
+    return re.sub(r"\s+", " ", value).strip()
+
+def _first_present(payload: dict, *keys: str):
+    for key in keys:
+        if key in payload and payload.get(key) is not None:
+            return payload.get(key)
+    return ""
+
+def _build_address_lines(line1, line2=""):
+    return [line for line in (_clean_text(line1), _clean_text(line2)) if line]
+
+def _format_address_for_note(address_lines, city, state, postal_code):
+    state_postal = " ".join(part for part in (_clean_text(state), _clean_text(postal_code)) if part)
+    locality = ", ".join(part for part in (_clean_text(city), state_postal) if part)
+    parts = list(address_lines)
+    if locality:
+        parts.append(locality)
+    return ", ".join(parts)
+
+def _fit_overlay_text(pdf_canvas, text, max_width, font_name="Helvetica-Bold", start_size=10, min_size=7):
+    size = start_size
+    while size > min_size and pdf_canvas.stringWidth(text, font_name, size) > max_width:
+        size -= 0.5
+
+    pdf_canvas.setFont(font_name, size)
+    if pdf_canvas.stringWidth(text, font_name, size) <= max_width:
+        return text
+
+    ellipsis = "..."
+    shortened = text
+    while shortened and pdf_canvas.stringWidth(shortened + ellipsis, font_name, size) > max_width:
+        shortened = shortened[:-1]
+    return (shortened.rstrip() + ellipsis) if shortened else ellipsis
 
 # ===== OAuth helpers =====
 def get_token():
@@ -106,32 +152,33 @@ def create_label():
 
         # sender (customer)
         to = body["to"]
-        sender_name  = (to.get("name") or "").strip() or "Sender"
-        sender_addr  = f"{to.get('addr1','')}, {to.get('city','')}, {to.get('state','')} {to.get('zip','')}"
+        sender_name = _clean_text(_first_present(to, "name")) or "Sender"
+        sender_addr1 = _first_present(to, "addr1", "address1", "address_line_1", "addressLine1")
+        sender_addr2 = _first_present(to, "addr2", "address2", "address_line_2", "addressLine2")
+        sender_address_lines = _build_address_lines(sender_addr1, sender_addr2)
+        sender_city = _clean_text(_first_present(to, "city"))
+        sender_state = _clean_text(_first_present(to, "state", "state_code", "stateCode")).upper()
+        sender_zip = _clean_text(_first_present(to, "zip", "postal_code", "postalCode"))
+        sender_country = (_clean_text(_first_present(to, "country", "country_code", "countryCode")) or "US").upper()
+        sender_phone = _clean_text(_first_present(to, "phone"))
+        sender_addr = _format_address_for_note(sender_address_lines, sender_city, sender_state, sender_zip)
         ship_from = {
             "Name": sender_name,
             "CompanyName": sender_name,
             "AttentionName": sender_name,
             "Address": {
-                "AddressLine": [to.get("addr1","")],
-                "City": to.get("city",""),
-                "StateProvinceCode": to.get("state",""),
-                "PostalCode": to.get("zip",""),
-                "CountryCode": to.get("country","US"),
+                "AddressLine": sender_address_lines or [""],
+                "City": sender_city,
+                "StateProvinceCode": sender_state,
+                "PostalCode": sender_zip,
+                "CountryCode": sender_country,
             }
         }
-        if (to.get("phone") or "").strip():
-            ship_from["Phone"] = {"Number": to["phone"].strip()}
+        if sender_phone:
+            ship_from["Phone"] = {"Number": sender_phone}
 
         # lab (destination)
-        LAB_ZIP = "85233"
-        lab_addr = {
-            "AddressLine": ["700 North Neely Street, Ste. #17"],
-            "City": "Gilbert",
-            "StateProvinceCode": "AZ",
-            "PostalCode": LAB_ZIP,
-            "CountryCode": "US",
-        }
+        lab_addr = {**LAB_ADDRESS, "AddressLine": LAB_ADDRESS["AddressLine"][:]}
 
         shipment = {
             "Description": "Dental Products",
@@ -153,7 +200,7 @@ def create_label():
             "Service": {"Code": "03"},
             "ShipmentServiceOptions": {"ReturnService": {"Code": "02"}},  # PRL
             "ShipFrom": ship_from,
-            "ShipTo": { "Name": "First Impressions Dental Lab", "Address": lab_addr },
+            "ShipTo": { "Name": LAB_NAME, "Address": lab_addr },
 
             "Package": {
                 "Packaging": {"Code": "02"},
@@ -210,8 +257,10 @@ def create_label():
 
             # Draw centered white text
             c.setFillColorRGB(1, 1, 1)
-            c.setFont("Helvetica-Bold", 10)
-            note = f"FROM: {sender_name} • {sender_addr}"[:110]
+            note = f"FROM: {sender_name}"
+            if sender_addr:
+                note = f"{note} • {sender_addr}"
+            note = _fit_overlay_text(c, note, ph - 36)
             c.drawString(18, 13, note)  # shifted up a bit for perfect vertical centering
 
             c.restoreState()
