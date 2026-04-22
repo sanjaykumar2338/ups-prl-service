@@ -178,7 +178,9 @@ def create_label():
             ship_from["Phone"] = {"Number": sender_phone}
 
         # lab (destination)
-        lab_addr = {**LAB_ADDRESS, "AddressLine": LAB_ADDRESS["AddressLine"][:]}
+        # Keep the destination address lines in UPS street-then-suite order.
+        lab_street, lab_suite = LAB_ADDRESS["AddressLine"]
+        lab_addr = {**LAB_ADDRESS, "AddressLine": [lab_street, lab_suite]}
 
         shipment = {
             "Description": "Dental Products",
