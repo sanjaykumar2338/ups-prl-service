@@ -35,7 +35,7 @@ SHIPPER_NO = os.getenv("UPS_SHIPPER_NUMBER")  # UPS account number used for PRL 
 PROMO_CODE = os.getenv("UPS_PROMO_CODE", "EIGSHIPSUPS")
 LAB_NAME = "First Impressions Dental Lab"
 LAB_ADDRESS = {
-    "AddressLine": ["701 W. Southern Ave #104"],
+    "AddressLine": ["701 W. Southern Ave", "#104"],
     "City": "Mesa",
     "StateProvinceCode": "AZ",
     "PostalCode": "85210",
